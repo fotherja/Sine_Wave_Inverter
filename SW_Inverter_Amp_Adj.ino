@@ -2,42 +2,44 @@
   J.Fotherby 2020  
   Sinewave inverter: Amplitude and frequency adjustable 
 
-  - When circuit powers on it ramps the AC frequency from 30 to 50Hz adjusting the amplitude proportionally. 
+  - Do nothing for 1 minute after turn on -> to allow compressor pressures to equalise (should device be turned off and then straight on again
+  - When circuit powers on it ramps the AC frequency from 30 to 50Hz adjusting the amplitude proportionally (this soft starts the fridge motor) 
 
-  To Do:
-   - Get amplitude compensation for changes in input voltage. This will definitely help to reduce power consumption.
-   
-   - Start programming the logic of the circuit:
-    - Do nothing for 1 minute after turn on
-    - Then every 5 minutes do a load connected test -> Apply power and see whether it causes any current flow.
-    - If current is being drawn, continue to power the load. If no current is drawn, enter a low power shutdown mode and switch off the inverter
-    - If the current sensor measurements ever exceed a peak value, immediately shutoff the inverter. Retry 5 minutes later.
+  The circuit then turns the fridge on and off based on the temperature measured by the thermastat     
 
-
-  # ADC 0 -> Used for measuring input voltage and slightly adjusting the output amplitude to compensate for fluctuations
-  # ADC 2 -> Used to measure the output current for load connected testing and overcurrent protection
+  # ADC 0 -> Measures fridge temperature
+  # ADC 2 -> Measures input voltage
 */
  
 //------------------------------------------------------------------------------------- 
-//------------------------------------------------------------------------------------- 
-#define         CURRENT_OUT         A0
-#define         INVERTER_CTRL_PIN   A1
+//-------------------------------------------------------------------------------------
+#include "LowPower.h"
+ 
+#define         TEMP_SENSE          A0                          // 
+#define         INVERTER_CTRL_PIN   A1                          // This switches the DC-DC converter on/off for power savings
 #define         VOLTAGE_IN          A2
-#define         PHASE_B_PIN         A3
+#define         PHASE_B_PIN         A3                          // Our low frequency phase flipping  square wave output
 
-#define         LED_PIN             9
-#define         PHASE_A_PIN         10
+#define         LED_PIN             9                           // Just an indicator LED
+#define         PHASE_A_PIN         10                          // Our High frequency PWM pin
 
-#define         SINE_STEPS          256
-#define         UPPER_ADC_V_VAL     980
-#define         LOWER_ADC_V_VAL     725
+#define         SINE_STEPS          256                         // Number of steps to build our sinewave in
 
 #define         STATE_OFF           0
 #define         STATE_RAMP          1
 #define         STATE_ON            2
 
-#define         START_FREQUENCY     43
-#define         RAMP_TIMESTEP       50
+#define         START_FREQUENCY     42                          // 42 corrosponds to a 30Hz start frequency
+#define         MAX_FREQUENCY       127
+#define         RAMP_TIMESTEP       50                          // Timestep of 50ms corrosponds to a frequency ramp at a rate of ~4.5Hz/sec
+
+#define         LOW_VOLT_CUTOUT     810                         // When voltage falls below this arbitary value we shutdown to protect the battery
+#define         HIGH_VOLT_CUTIN     855                         // 810 - 855 corrisponds to 3.6v - 3.8v per cell
+#define         LOW_TEMP_CUTOUT     510                         // When sensor in proper fridge the range was approx 505 - ?520?                 
+#define         HIGH_TEMP_CUTIN     535 
+
+void Startup ();
+void Shutdown ();
 
 //-------------------------------------------------------------------------------------
 unsigned int    Sine_Lookup[128]          =       {0,20,39,59,78,98,117,137,156,175,194,213,232,251,269,288,            // Duty cycles to step through to produce a sinewave
@@ -71,19 +73,19 @@ byte            Amp_Freq_Adj_LOOKUP[128]  =       {26,26,26,27,27,27,27,28,28,28
 int             Index_Phase         = 255;                      // Index incremented to step through the sinewave generation duty cycles
 byte            Amplitude_Adj       = 32;                       // We multiply the duty cycle value by this then >> 6 (ie. /64) It's a CPU efficient way of scaling values 
 byte            Step_Delay_us       = 125;                      
-byte            State               = STATE_RAMP;               // Either OFF, RAMP or ON            
+byte            State               = STATE_OFF;                // Either OFF, RAMP or ON            
 byte            Frequency           = START_FREQUENCY;          // This is not in hertz. The range is 0-127 which corrosponds to 20-50Hz
 
 unsigned long   TimeStamp_Sine      = 0;
 unsigned long   TimeStamp_Ramp      = 0;
 unsigned int    Next_OCR1B          = 0;   
-
+ 
 unsigned int    ADC_Raw_Temp_Val;  
 unsigned int    ADC_Raw_Volt_Val;
 
 //-------------------------------------------------------------------------------------
 void setup() 
-{          
+{      
   pinMode(PHASE_A_PIN, OUTPUT);   
   pinMode(PHASE_B_PIN, OUTPUT);
   pinMode(LED_PIN, OUTPUT);
@@ -91,13 +93,10 @@ void setup()
     
   digitalWrite(PHASE_A_PIN, LOW);    
   digitalWrite(PHASE_B_PIN, LOW); 
-  digitalWrite(LED_PIN, HIGH);
-  digitalWrite(INVERTER_CTRL_PIN, HIGH); 
-
-  delay(2000);                                                  // Delay a bit to allow the inverter high voltage capacitor to charge up  
+  digitalWrite(INVERTER_CTRL_PIN, LOW);
 
   TCCR1A = 0b00100010;
-  TCCR1B = 0b00011001;                                          // 20KHz FAST PWM with ICR1 control
+  TCCR1B = 0b00011001;                                          // Configure for 20KHz FAST PWM with ICR1 control
   ICR1 = 799;
   TCNT1 = 0; 
   OCR1B = 0;
@@ -106,8 +105,7 @@ void setup()
   ADCSRA = B10000111;                                           // 128 Prescaler -> ADC Clk = 125KHz
   ADCSRA |= B01000000;                                          // Start a conversion in the background
   
-  Serial.begin(115200);
-  Serial.println("starting");
+  //Serial.begin(115200); Serial.println("Starting...");
   delay(100);
   
   TimeStamp_Sine = micros();
@@ -116,71 +114,118 @@ void setup()
 //-------------------------------------------------------------------------------------
 void loop() 
 {     
-  // 1) Increment the step counter to vary our duty cycle of the PWM signal and modulate a sinewave
+  // 1) Increment the step counter
   Index_Phase += 1;
   if(Index_Phase >= SINE_STEPS)  {
     Index_Phase = 0;
   }
+  
 
   // 2) See if any ADC conversions are complete and act accordingly:  
   if(millis() - TimeStamp_Ramp >= RAMP_TIMESTEP)
   {    
     TimeStamp_Ramp = millis();
-    
+
+    // First read the ADCs. 1 for the input voltage, 2 for the temperature of the fridge
     if(ADCSRA & B00010000)  {                                   // If ADC conversion complete 
-      if(ADMUX == B01000010) {                                  // ADC1 conversion complete
-        ADC_Raw_Temp_Val = ADCL | (ADCH << 8);                          
-        
+      if(ADMUX == B01000010) {                                  // ADC2 conversion complete
+        ADC_Raw_Volt_Val = ADCW;
         ADMUX = B01000000;                                      // Select ADC channel 0 this time       
         ADCSRA |= B00010000;                                    // This clears the ADC complete flag and allows the new MUX channel to be written
         ADCSRA |= B01000000;                                    // Start a conversion in the background      
       }
       else if(ADMUX == B01000000)  {                            // ADC0 conversion complete
-        ADC_Raw_Volt_Val = ADCL | (ADCH << 8);                  // The voltage will only vary between 20-26volts at most = 222 ADC counts with a 2.2K || 10K divider. Make 256 the range
- 
-        ADMUX = B01000010;                                      // Select ADC channel 1    
+        ADC_Raw_Temp_Val = ADCW;                  
+        ADMUX = B01000010;                                      // Select ADC channel 2    
         ADCSRA |= B00010000;
         ADCSRA |= B01000000;                                    // Start a conversion in the background                        
       }
     }
 
 
-    // Logic
-    if(Frequency == 127) {
+    // If we're not at out max frequency yet, ramp it up
+    if(Frequency == MAX_FREQUENCY) {
       State = STATE_ON;
     }    
     else if(State == STATE_RAMP) {
       Frequency++;
+    } 
+    else if(State == STATE_OFF)  {
+      LowPower.idle(SLEEP_1S, ADC_ON, TIMER2_OFF, TIMER1_OFF, TIMER0_OFF, SPI_OFF, USART0_OFF, TWI_OFF);
+    }
+
+
+    // Protect battery from over discharge ############################
+    static int Low_Temp_Cutout_Count = 1200;
+    static int High_Temp_Cutin_Count = 60;
+    static byte Low_Volt_Cutout_Count = 20;
+    static byte High_Volt_Cutin_Count = 20;    
+    static byte Low_Volt_Flag = 1;
+    
+    if(ADC_Raw_Volt_Val < LOW_VOLT_CUTOUT and Low_Volt_Flag == 0)  {      
+      Low_Volt_Cutout_Count -= 1;
+      if(Low_Volt_Cutout_Count == 0)  {
+        Low_Volt_Cutout_Count = 20;
+        Low_Volt_Flag = 1;   //Serial.print("V");        
+        Shutdown(); 
+      }
+    }
+    else  {
+      Low_Volt_Cutout_Count = 20;
     }    
 
-
-//    // Startup procedure: Turn the inverter on, then start sinewave generation    
-//    digitalWrite(Inverter_On_Off, HIGH);
-//    TimeStamp_Sine = micros();
-//    Index_Phase = 0; 
-//    State = STATE_RAMP;
-//    Frequency = START_FREQUENCY;
-//      
-//    // Shutdown procedure: Turn off the inverter, then ensure Phase A&B both go low simultaneously 
-//    digitalWrite(INVERTER_CTRL_PIN, LOW); 
-//    State = STATE_OFF;      
-//    TCNT1 = 793;                                                          
-//    OCR1B = 0;    
-//    PORTC = PORTC & 0b11110111;                             
+    if(ADC_Raw_Volt_Val > HIGH_VOLT_CUTIN and Low_Volt_Flag == 1)  {      
+      High_Volt_Cutin_Count -= 1;
+      if(High_Volt_Cutin_Count == 0)  {
+        High_Temp_Cutin_Count = 60;
+        High_Volt_Cutin_Count = 20;        
+        Low_Volt_Flag = 0;   //Serial.print("P");                
+      }
+    }
+    else  {
+      High_Volt_Cutin_Count = 20;
+    }
     
 
+    // Turn off if fridge cold enough #################################    
+    if(ADC_Raw_Temp_Val < LOW_TEMP_CUTOUT and State == STATE_ON)  {      
+      Low_Temp_Cutout_Count -= 1;
+      if(Low_Temp_Cutout_Count == 0)  {
+        High_Temp_Cutin_Count = 60;                             // Ensure the fridge doesn't turn on for at least a minute
+        Low_Temp_Cutout_Count = 20;        
+        Shutdown();    //Serial.print("C");
+      }
+    }
+    else if(Low_Temp_Cutout_Count < 20)  {
+      Low_Temp_Cutout_Count = 20;
+    }        
+
+    // Turn on if fridge too warm #####################################
+    if(ADC_Raw_Temp_Val > HIGH_TEMP_CUTIN and State == STATE_OFF and Low_Volt_Flag == 0)  {      
+      High_Temp_Cutin_Count -= 1;
+      if(High_Temp_Cutin_Count == 0)  {
+        Low_Temp_Cutout_Count = 1200;                           // Ensure the fridge doesn't turn off for at least a minute
+        High_Temp_Cutin_Count = 20;        
+        Startup();     //Serial.print("H");
+      }
+    }
+    else if(High_Temp_Cutin_Count < 20) {
+      High_Temp_Cutin_Count = 20;
+    }
+    
+    //Serial.println(ADC_Raw_Volt_Val);
 
     Step_Delay_us = Step_Delay_LOOKUP[Frequency];               // Step_Delay_us -> 20Hz - 50Hz 
     Amplitude_Adj = Amp_Freq_Adj_LOOKUP[Frequency];             // Change the amplitude proportional to the frequency. At 25Hz the amplitude should be half that of 50Hz        
   }
 
   
-  // 3) Have a constant delay in our loop for stepping through our sinewave generation
+  // 5) Have a constant delay in our loop for stepping through our sinewave generation
   while(micros() - TimeStamp_Sine < Step_Delay_us) {}      
   TimeStamp_Sine += Step_Delay_us;
   
   
-  // 4) Vary the duty cycle on PHASE_A. PHASE_B is a 50Hz square wave. Simultaneously flip our PHASE_A & B lines at the zero crossing points (0 & 180 degrees)
+  // 6) Vary the duty cycle on PHASE_A. PHASE_B is a square wave. Simultaneously flip our PHASE_A & B lines at the zero crossing points (0 & 180 degrees)
   if(State != STATE_OFF)
   { 
     if(Index_Phase == 0)  {         
@@ -207,6 +252,31 @@ void loop()
 }
 
 
+void Startup ()
+{
+  // Startup procedure: Turn the inverter on, then start sinewave generation    
+  digitalWrite(INVERTER_CTRL_PIN, HIGH);
+  digitalWrite(LED_PIN, HIGH);
+  delay(2000);
+
+  Index_Phase = 0; 
+  State = STATE_RAMP;
+  Frequency = START_FREQUENCY; 
+  TimeStamp_Sine = micros();   
+}
+
+
+void Shutdown ()
+{
+  // Shutdown procedure: Turn off the inverter, then ensure Phase A&B both go low simultaneously 
+  digitalWrite(INVERTER_CTRL_PIN, LOW); 
+  digitalWrite(LED_PIN, LOW);
+  State = STATE_OFF; 
+  Frequency = START_FREQUENCY;     
+  TCNT1 = 793;                                                          
+  OCR1B = 0;    
+  PORTC = PORTC & 0b11110111;  
+}
 
 
 
@@ -222,20 +292,6 @@ void loop()
 
 
 
-
-        //Amplitude_Adj *= 22v / Vin 
-        //In_Voltage_Val = min(ADC_Raw_Volt_Val, UPPER_ADC_V_VAL);
-        //In_Voltage_Val = max(In_Voltage_Val, LOWER_ADC_V_VAL);
-        //In_Voltage_Val -= LOWER_ADC_V_VAL; 
-        //In_Voltage_Val >>= 
-
-
-
-
-
-//  Step_Delay_us = Step_Delay_LOOKUP[127];               // Step_Delay_us -> 20Hz - 50Hz 
-//  Amplitude_Adj = Amp_Freq_Adj_LOOKUP[127];             // Change the amplitude proportional to the frequency. At 25Hz the amplitude should be half that of 50Hz
-//  State = STATE_ON;
 
 
 
