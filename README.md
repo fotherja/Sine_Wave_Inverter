@@ -10,7 +10,7 @@ This software is responsible for generating the PWM. It also enables and disable
 
 
 These are the pin connections:
-#define         CURRENT_SENSE       A0                           
+#define         CURRENT_SENSE       A0
 #define         INVERTER_CTRL_PIN   A1                          // This switches the DC-DC converter on/off for power savings
 #define         VOLTAGE_IN          A2
 #define         PHASE_B_PIN         A3                          // Our low frequency phase flipping  square wave output
