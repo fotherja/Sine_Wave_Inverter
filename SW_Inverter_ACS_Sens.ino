@@ -16,6 +16,10 @@
 
   To Do:
    - Test, Test, Test!!!
+
+  Possible Improvements:
+   - Different Amplitude lookup tables for different input voltages. Say for 21-22, 22-23, 23-24, 24-25. 
+        Built in hysterisis since increasing amplitude at lower voltages would draw more current and drop the input voltage further keeping the system in that amplitude range.
 */
  
 //------------------------------------------------------------------------------------- 
@@ -26,8 +30,8 @@
  
 #define         CURRENT_SENSE       A0                           
 #define         INVERTER_CTRL_PIN   A1                          // This switches the DC-DC converter on/off for power savings
-#define         VOLTAGE_IN          A2
-#define         PHASE_B_PIN         A3                          // Our low frequency phase flipping  square wave output
+#define         VOLTAGE_SENSE       A2
+#define         PHASE_B_PIN         A3                          // Our low frequency phase flipping square wave output
 
 #define         ACS_nENABLE         2                           // When Low, powers the ACS712, When high, shuts it down
 #define         LED_PIN             9                           // Just an indicator LED
