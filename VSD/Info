@@ -1,0 +1,7 @@
+Notes:
+
+Minior improvement:
+Keep the GND trace all on the bottom. Move the Phase signal to top for consistancy
+
+I don't know whether any problems will be caused by having a ground loop. Perhaps the trace shoud be broken towards the bottom Gate driver chip
+I can't figure out the consequences of either choice.
